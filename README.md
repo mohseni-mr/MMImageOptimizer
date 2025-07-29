@@ -8,7 +8,7 @@
 ---
 
 <p align="center">
-    <img width="96" alt="MM Image Optimizer Logo" src='https://raw.githubusercontent.com/mohseni-mr/MMImageOptimizer/refs/heads/main/mohseni-blue-logo-96'/>
+    <img width="96" alt="MM Image Optimizer Logo" src='https://raw.githubusercontent.com/mohseni-mr/MMImageOptimizer/refs/heads/main/mohseni-blue-logo-96.png'/>
 </p>
 
 <h1 align="center">MM Image Optimizer</h1>
