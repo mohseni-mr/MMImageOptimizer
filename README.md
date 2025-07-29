@@ -8,7 +8,7 @@
 ---
 
 <p align="center">
-    <img width="96" alt="MM Image Optimizer Logo" src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNTYgMjU2Ij48cmVjdCB3aWR0aD0iMjU2IiBoZWlnaHQ9IjI1NiIgcng9IjY0IiBmaWxsPSIjMGY1MmJhIi8+PHBhdGggZD0iTTYzLjksNzkuMWMtMy43LTUuNC05LjktOC43LTE2LjQtOC43aC0xNS45bDEzLjcsMTcuOGgyLjNjLjcsMCwxLjMuMywxLjYuOWw0Ny4xLDY5LjRjMTIsMTcuNSwzNS45LDIyLDUzLjQsOS45LDMuOS0yLjcsNy4zLTYsOS45LTkuOWw0Ny4xLTY5LjRjLjEtLjIuMy0uNC41LS41LjktLjYsMi4xLS40LDIuNy41djYzLjdjMCw4LjItNi43LDE0LjktMTQuOSwxNC45aC03LjN2MTcuOGg3LjNjMTguMSwwLDMyLjctMTQuNiwzMi43LTMyLjd2LTYzLjdjLS41LTEwLjgtOS42LTE5LjEtMjAuNC0xOC43LTYuMi4zLTExLjksMy41LTE1LjQsOC43bC00Ny4yLDY5LjZjLTEuNCwxLjktMywzLjYtNC45LDQuOS05LjMsNi42LTIyLjIsNC40LTI4LjgtNC45bC00Ny4yLTY5LjZoMFpNNDYsMTUyLjl2LTM0bC0xNy44LDI0djEwYzAsMTguMSwxNC42LDMyLjcsMzIuNywzMi43aDcuM3YtMTcuOGgtNy4zYy04LjIsMC0xNC45LTYuNy0xNC45LTE0LjlaIiBmaWxsPSIjZmZmIi8+PC9zdmc+'/>
+    <img width="96" alt="MM Image Optimizer Logo" src='https://raw.githubusercontent.com/mohseni-mr/MMImageOptimizer/refs/heads/main/mohseni.ico'/>
 </p>
 
 <h1 align="center">MM Image Optimizer</h1>
