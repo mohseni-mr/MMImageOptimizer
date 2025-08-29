@@ -2,7 +2,7 @@
 MMImageOptimizer
 
 author: Mohammadreza Mohseni
-version: 1.2.0
+version: 1.0.0
 """
 
 import os
@@ -10,14 +10,12 @@ import platform
 import shutil
 import subprocess
 import sys
-import unicodedata
 import winreg
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Union
 
-from pymage_size import get_image_size
-from PySide6.QtCore import QByteArray, Qt, QThread, QTimer, Signal
+from PIL import Image
+from PySide6.QtCore import QByteArray, Qt, QThread, Signal
 from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
@@ -31,13 +29,12 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
-    QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -52,31 +49,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-
-# --- Robust Path Helper for Windows Long/Unicode Paths ---
-def robust_path(p: Union[str, Path]) -> str:
-    """Return a path string robust for long/Unicode paths on Windows."""
-    if not isinstance(p, (str, Path)):
-        return p
-    p = str(p)
-    if platform.system() == "Windows":
-        # Remove any existing prefix
-        if p.startswith("\\\\?\\"):
-            return p
-        # Accept both forward and backward slashes
-        p = p.replace("/", "\\")
-        # If path is already short, don't add prefix
-        if len(p) < 240 and not any(ord(c) > 127 for c in p):
-            return p
-        # Only add prefix for absolute paths
-        if os.path.isabs(p):
-            # UNC path
-            if p.startswith("\\\\"):  # network path
-                return "\\\\?\\UNC" + p[1:]
-            else:
-                return "\\\\?\\" + p
-    return p
 
 
 def is_windows_light_theme():
@@ -240,8 +212,8 @@ def get_optimal_thread_count():
 
 
 def should_resize(input_img_path, target_size):
-    img = get_image_size(robust_path(input_img_path))
-    width, height = img.get_dimensions()
+    img = Image.open(input_img_path)
+    width, height = img.size
 
     # Pixel value
     if isinstance(target_size, int):
@@ -344,19 +316,22 @@ class FileStats:
         return f"{size_bytes:.1f} TB"
 
 
-# --- Robust call helper using robust_path ---
 def call(args, progress_callback=None, use_gpu=False):
-    """Helper to call subprocess silently without console windows, robust to long/Unicode paths."""
-    str_args = [robust_path(arg) for arg in args]
+    """Helper to call subprocess silently without console windows"""
+    # Convert Path objects to strings for subprocess
+    str_args = [str(arg) for arg in args]
 
     # Add GPU acceleration if available and requested
     if use_gpu and str_args[0].endswith("magick.exe"):
+        # Insert GPU acceleration flags after magick command
         gpu_info = detect_gpu_acceleration()
         if gpu_info["available"]:
             if gpu_info["opencl"]:
                 str_args.insert(1, "-define")
                 str_args.insert(2, "accelerate:auto-threshold=1")
+            # Note: CUDA support would require different flags based on ImageMagick build
 
+    # Configure subprocess to run silently (no console window)
     startupinfo = None
     if platform.system() == "Windows":
         startupinfo = subprocess.STARTUPINFO()
@@ -378,33 +353,6 @@ def call(args, progress_callback=None, use_gpu=False):
 
 
 class ImageProcessor:
-    @staticmethod
-    def is_invalid_windows_filename(filename):
-        # Forbidden characters
-        forbidden = set('<>:"/\\|?*')
-        reserved = (
-            {"CON", "PRN", "AUX", "NUL"}
-            | {f"COM{i}" for i in range(1, 10)}
-            | {f"LPT{i}" for i in range(1, 10)}
-        )
-        # Remove extension for reserved check
-        name, *_ = filename.split(".")
-        # Check forbidden chars or reserved names
-        if any(c in forbidden for c in filename):
-            return True
-        if name.upper() in reserved:
-            return True
-        # Control chars
-        if any(ord(c) < 32 for c in filename):
-            return True
-        # Trailing space or dot
-        if filename.endswith(" ") or filename.endswith("."):
-            return True
-        # Only spaces or dots
-        if filename.strip(" .") == "":
-            return True
-        return False
-
     """Class to handle individual image processing with GPU support"""
 
     def __init__(self, use_gpu=False):
@@ -422,16 +370,6 @@ class ImageProcessor:
         strip_meta,
         output_dir,
     ):
-        # Pre-check for invalid or reserved file names (Windows)
-        errors = []
-        if platform.system() == "Windows":
-            # Normalize Unicode to NFC
-            norm_name = unicodedata.normalize("NFC", file_path.name)
-            if self.is_invalid_windows_filename(norm_name):
-                errors.append(f"Invalid or reserved file name: {file_path.name}")
-                stats = FileStats()
-                stats.errors = errors
-                return stats
         """Process a single image and return statistics"""
         stats = FileStats()
         original_size = file_path.stat().st_size
@@ -454,16 +392,13 @@ class ImageProcessor:
 
         # Resize step
         try:
-            resized = self.generate_resized_variants(
-                normalized, tmp_dir, base_name, resolutions
-            )
+            resized = self.pyramidal_resize(normalized, tmp_dir, base_name, resolutions)
         except Exception as e:
             errors.append(f"Resize failed: {file_path.name} ({e})")
             stats.errors = errors
             return stats
 
         # Process each resolution and format
-
         for res in resolutions:
             size = res["size"]
             source_png = resized[size]
@@ -475,10 +410,10 @@ class ImageProcessor:
                     if png_out.exists():
                         if not self.ask_overwrite(png_out):
                             continue
-                    shutil.copyfile(robust_path(source_png), robust_path(png_out))
+                    shutil.copyfile(source_png, png_out)
                     self.encode_png(
-                        robust_path(source_png),
-                        robust_path(png_out),
+                        source_png,
+                        png_out,
                         qmap.get("PNG", 82),
                         qlossless_map.get("PNG", True),
                     )
@@ -493,11 +428,7 @@ class ImageProcessor:
                     if webp_out.exists():
                         if not self.ask_overwrite(webp_out):
                             continue
-                    self.encode_webp(
-                        robust_path(source_png),
-                        robust_path(webp_out),
-                        qmap.get("WebP", 82),
-                    )
+                    self.encode_webp(source_png, webp_out, qmap.get("WebP", 82))
                     optimized_size = webp_out.stat().st_size
                     stats.add_file(original_size, optimized_size)
                 except Exception as e:
@@ -509,11 +440,7 @@ class ImageProcessor:
                     if avif_out.exists():
                         if not self.ask_overwrite(avif_out):
                             continue
-                    self.encode_avif(
-                        robust_path(source_png),
-                        robust_path(avif_out),
-                        qmap.get("AVIF", 65),
-                    )
+                    self.encode_avif(source_png, avif_out, qmap.get("AVIF", 65))
                     optimized_size = avif_out.stat().st_size
                     stats.add_file(original_size, optimized_size)
                 except Exception as e:
@@ -526,8 +453,8 @@ class ImageProcessor:
                         if not self.ask_overwrite(jpg_out):
                             continue
                     self.encode_jpegli(
-                        robust_path(source_png),
-                        robust_path(jpg_out),
+                        source_png,
+                        jpg_out,
                         qmap.get("JPEG", 82),
                         qlossless_map.get("JPEG", False),
                     )
@@ -542,9 +469,9 @@ class ImageProcessor:
     def normalize_to_png(self, input_path, tmp_dir, base_name):
         out_png = tmp_dir / f"{base_name}_norm.png"
         if input_path.suffix.lower() == ".png":
-            shutil.copyfile(robust_path(input_path), robust_path(out_png))
+            shutil.copyfile(input_path, out_png)
         else:
-            cmd = [MAGICK, robust_path(input_path), robust_path(out_png)]
+            cmd = [MAGICK, input_path, out_png]
             call(cmd, use_gpu=self.use_gpu)
         return out_png
 
@@ -560,157 +487,118 @@ class ImageProcessor:
 
         return sorted(res_modes, key=key_fn, reverse=True)
 
-    def generate_resized_variants(
+    def pyramidal_resize(
         self,
         input_path,
         tmp_dir,
         base_name,
         res_modes,
     ):
-        """Generate independent resized copies from the original for maximum quality.
+        intermediates = []
+        original_img = input_path
 
-        Args:
-            input_path: Path to original image.
-            tmp_dir: Temporary directory for outputs.
-            base_name: Base filename without extension.
-            res_modes: List of dicts like [{'size': 256, 'mode': 'fit'}, {'size': '50%', 'mode': 'crop'}].
-
-        Returns:
-            Dict of {size_key: output_path} for successful resizes.
-
-        Raises:
-            ValueError: If invalid resize parameters.
-        """
-        intermediates = {}
-
-        # Early exit if no modes
-        if not res_modes:
-            return intermediates
-
-        # Get original dimensions once (avoids repeated I/O)
-        try:
-            img_info = get_image_size(robust_path(input_path))
-            orig_width, orig_height = img_info.get_dimensions()
-        except Exception as e:
-            raise ValueError(f"Failed to get original dimensions: {e}")
-
-        # Handle "original" separately if present
-        has_original = any(r.get("size") == "original" for r in res_modes)
-        if has_original:
+        # Handle "original" mode - no resizing
+        if len(res_modes) == 1 and res_modes[0].get("size") == "original":
             out_path = tmp_dir / f"{base_name}_original.png"
-            shutil.copyfile(robust_path(input_path), robust_path(out_path))
-            intermediates["original"] = out_path
-            res_modes = [r for r in res_modes if r.get("size") != "original"]
+            shutil.copyfile(original_img, out_path)
+            intermediates.append(("original", out_path))
+            return dict(intermediates)
 
-        # Sort modes descending (largest first) for potential future optimizations
+        # Handle normal resizing - each resize works from the original image
         sorted_modes = self.sort_res_modes(res_modes)
 
         for r in sorted_modes:
             size = r["size"]
             mode = r.get("mode", "fit")
+            out_path = tmp_dir / f"{base_name}_{size}.png"
 
-            # Validate and normalize size early
-            try:
-                validated_size = validate_resize_input(size)
-            except ValueError as e:
-                self.errors.append(f"Invalid resize size '{size}': {e}")
+            if not should_resize(original_img, size):
                 continue
 
-            # Compute target dimensions as integers to avoid float drift
-            if isinstance(validated_size, str) and validated_size.endswith("%"):
-                pct = float(validated_size.rstrip("%")) / 100.0
-                target_width = int(orig_width * pct)  # Truncate to int
-                target_height = int(orig_height * pct)
-                if target_width < 1 or target_height < 1:
-                    continue  # Skip tiny sizes
-                resize_str = f"{target_width}x{target_height}"
-            else:  # Pixel size
-                target_size = int(validated_size)
-                if mode in ["fit", "crop"]:
-                    # Preserve aspect ratio for fit/crop
-                    aspect = orig_width / orig_height
-                    if orig_width > orig_height:
-                        target_width = target_size
-                        target_height = int(target_size / aspect)
-                    else:
-                        target_height = target_size
-                        target_width = int(target_size * aspect)
-                    resize_str = f"{target_width}x{target_height}"
+            # Pixel resize (int)
+            if isinstance(size, int):
+                if mode == "fit":
+                    resize_str = f"{size}x{size}"
+                elif mode == "crop":
+                    resize_str = f"{size}x{size}^"
+                    # For crop mode, add gravity and extent
+                    cmd = [
+                        MAGICK,
+                        original_img,
+                        "-colorspace",
+                        "RGB",
+                        "-filter",
+                        "RobidouxSharp",
+                        "-resize",
+                        resize_str,
+                        "-gravity",
+                        "center",
+                        "-extent",
+                        f"{size}x{size}",
+                        "-colorspace",
+                        "sRGB",
+                        out_path,
+                    ]
                 elif mode == "width":
-                    resize_str = f"{target_size}x"
+                    resize_str = f"{size}x"
                 elif mode == "height":
-                    resize_str = f"x{target_size}"
+                    resize_str = f"x{size}"
                 else:
-                    raise ValueError(f"Unknown mode: {mode}")
+                    raise ValueError(f"Unknown resize mode: {mode}")
 
-            # Skip if not downscaling (as per should_resize)
-            if not should_resize(input_path, validated_size):
-                continue
+                # For non-crop modes, use standard command
+                if mode != "crop":
+                    cmd = [
+                        MAGICK,
+                        original_img,
+                        "-colorspace",
+                        "RGB",
+                        "-filter",
+                        "RobidouxSharp",
+                        "-resize",
+                        resize_str,
+                        "-colorspace",
+                        "sRGB",
+                        out_path,
+                    ]
 
-            out_path = tmp_dir / f"{base_name}_{validated_size}.png"
-
-            # Build cmd with quality flags
-            cmd_base = [
-                MAGICK,
-                robust_path(input_path),
-                "-colorspace",
-                "RGB",
-                "-filter",
-                "RobidouxSharp",  # Your high-quality filter
-            ]
-
-            if mode == "crop":
-                cmd = cmd_base + [
+            # Percent resize (str like "50%")
+            elif isinstance(size, str) and size.endswith("%"):
+                resize_str = size
+                cmd = [
+                    MAGICK,
+                    original_img,
+                    "-colorspace",
+                    "RGB",
+                    "-filter",
+                    "RobidouxSharp",
                     "-resize",
-                    f"{resize_str}^",
-                    "-gravity",
-                    "center",
-                    "-extent",
-                    f"{target_width}x{target_height}",
+                    resize_str,
+                    "-colorspace",
+                    "sRGB",
+                    out_path,
                 ]
             else:
-                cmd = cmd_base + ["-resize", resize_str]
+                raise ValueError(f"Unsupported size format: {size}")
 
-            cmd += ["-colorspace", "sRGB", robust_path(out_path)]
+            call(cmd, use_gpu=self.use_gpu)
+            intermediates.append((size, out_path))
 
-            try:
-                call(cmd, use_gpu=self.use_gpu)
-                intermediates[validated_size] = out_path
-            except subprocess.CalledProcessError as e:
-                # Robust: Skip and log instead of crashing
-                self.errors.append(f"Error resizing to {validated_size}: {e}")
-                continue  # Or raise if critical
-
-        return intermediates
+        return dict(intermediates)
 
     def encode_webp(self, in_png, out_path, quality):
-        cmd = [
-            CWEBP,
-            "-q",
-            str(quality),
-            robust_path(in_png),
-            "-o",
-            robust_path(out_path),
-        ]
+        cmd = [CWEBP, "-q", str(quality), in_png, "-o", out_path]
         call(cmd)
 
     def encode_avif(self, in_png, out_path, quality):
-        cmd = [
-            AVIFENC,
-            "-q",
-            str(quality),
-            "--speed",
-            "2",
-            robust_path(in_png),
-            robust_path(out_path),
-        ]
+        cmd = [AVIFENC, "-q", str(quality), "--speed", "2", in_png, out_path]
         call(cmd)
 
     def encode_jpegli(
         self, in_png, out_path, quality=None, lossless=False, chroma_444=False
     ):
         """Encode JPEG with jpegli (cjpegli) CLI."""
-        cmd = [str(CJPEGLI), robust_path(in_png), robust_path(out_path)]
+        cmd = [str(CJPEGLI), str(in_png), str(out_path)]
 
         if lossless:
             cmd += ["--distance", "1.0"]
@@ -735,8 +623,8 @@ class ImageProcessor:
             "--zopfli",
             "--force",
             "--out",
-            robust_path(out_path),
-            robust_path(in_png),
+            out_path,
+            in_png,
             "--timeout",
             "30",
             "--interlace",
@@ -757,9 +645,9 @@ class ImageProcessor:
                 "--speed",
                 "1",
                 "--output",
-                robust_path(out_path),
+                out_path,
                 "--force",
-                robust_path(out_path),
+                out_path,
             ]
             call(pq_cmd)
 
@@ -1019,316 +907,6 @@ class DragDropLabel(QLabel):
             self.files_dropped.emit(accepted)
             event.acceptProposedAction()
         self.apply_default_style()
-
-
-class ResolutionDialog(QDialog):
-    def __init__(self, parent=None, existing_sizes=None, input_files=None):
-        super().__init__(parent)
-        self.setWindowTitle("Add Resolution")
-        self.existing_sizes = existing_sizes or set()  # To check duplicates
-        self.input_files = input_files or []  # For preview dims
-        self.setFixedWidth(320)  # Smaller and compact
-
-        # Layout with reduced spacing
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        # Size input (compact)
-        size_layout = QHBoxLayout()
-        size_layout.setSpacing(5)
-        size_label = QLabel("Size:")
-        size_label.setFixedWidth(40)
-        size_layout.addWidget(size_label)
-        self.size_input = QLineEdit("256")
-        self.size_input.setPlaceholderText("e.g., 256 or 50%")
-        self.size_input.textChanged.connect(self.handle_text_changed)
-        size_layout.addWidget(self.size_input)
-
-        self.unit_combo = QComboBox()
-        self.unit_combo.addItems(["Pixels", "Percent"])
-        self.unit_combo.setFixedWidth(80)
-        self.unit_combo.currentTextChanged.connect(self.validate_and_update)
-        size_layout.addWidget(self.unit_combo)
-        layout.addLayout(size_layout)
-
-        # Mode selection (compact)
-        mode_layout = QHBoxLayout()
-        mode_layout.setSpacing(5)
-        mode_label = QLabel("Mode:")
-        mode_label.setFixedWidth(40)
-        mode_layout.addWidget(mode_label)
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["fit", "crop", "width", "height"])
-        self.mode_combo.setCurrentText("fit")
-        self.mode_combo.setToolTip(
-            "Fit: Scales to fit within size, preserving aspect ratio\n"
-            "Crop: Scales and crops to exact size\n"
-            "Width: Scales to exact width, auto height\n"
-            "Height: Scales to exact height, auto width"
-        )
-        mode_layout.addWidget(self.mode_combo)
-        layout.addLayout(mode_layout)
-
-        # Validation and preview (compact, smaller font)
-        self.validation_label = QLabel("")
-        self.validation_label.setStyleSheet("color: red; font-size: 10px;")
-        layout.addWidget(self.validation_label)
-
-        self.preview_label = QLabel("Preview: Not available")
-        self.preview_label.setStyleSheet("font-size: 10px; color: #888;")
-        layout.addWidget(self.preview_label)
-
-        # Buttons (compact)
-        self.button_box = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
-        )
-        self.button_box.setContentsMargins(0, 5, 0, 0)
-        self.button_box.accepted.connect(self.accept)
-        self.button_box.rejected.connect(self.reject)
-        self.ok_button = self.button_box.button(QDialogButtonBox.Ok)
-        self.ok_button.setEnabled(False)  # Disabled until valid
-        layout.addWidget(self.button_box)
-
-        # Theme styling
-        self.apply_theme()
-
-        # Get reference dimensions for preview
-        self.ref_width, self.ref_height = self.get_reference_dimensions()
-
-        # Timer for debounced clamping
-        self.clamp_timer = QTimer(self)
-        self.clamp_timer.setSingleShot(True)
-        self.clamp_timer.setInterval(500)  # 0.5s delay for clamping
-        self.clamp_timer.timeout.connect(self.apply_clamp)
-
-        self.validate_and_update()  # Initial validation
-
-    def apply_theme(self):
-        """Apply light/dark theme based on system settings."""
-        is_light = is_windows_light_theme()
-        text_color = "#181818" if is_light else "#ffffff"
-        bg_color = "rgba(255,255,255,0.95)" if is_light else "rgba(30,30,30,0.95)"
-        self.setStyleSheet(
-            f"""
-            QDialog {{ background-color: {bg_color}; color: {text_color}; }}
-            QLineEdit[valid="true"] {{ border: 1px solid green; }}
-            QLineEdit[valid="false"] {{ border: 1px solid red; }}
-        """
-        )
-
-    def get_reference_dimensions(self):
-        """Get dimensions of a sample input file or use default."""
-        if self.input_files:
-            try:
-                img = get_image_size(robust_path(self.input_files[0]))
-                return img.get_dimensions()
-            except Exception:
-                pass
-        return 1920, 1080  # Default if no files or error
-
-    def handle_text_changed(self, text):
-        """Handle text changes: auto-switch unit if % present, and trigger validation."""
-        stripped = text.strip()
-        if stripped.endswith("%"):
-            self.unit_combo.setCurrentText("Percent")
-            # Remove % temporarily for validation, but keep it in input
-        self.validate_and_update()
-
-    def validate_and_update(self):
-        """Allow free typing, show warnings, clamp only on submit/focus out. Great UX."""
-        text = self.size_input.text().strip()
-        unit = self.unit_combo.currentText()
-        mode = self.mode_combo.currentText()
-        error_msg = ""
-        preview = "Preview: Not available"
-        valid = False
-        w = h = None
-        min_px = 8
-        max_px = 10000
-        min_pct = 0.5
-        max_pct = 100
-
-        # Normalize input: auto-add/remove % as needed
-        if unit == "Percent":
-            if text and not text.endswith("%"):
-                try:
-                    float(text)
-                    self.size_input.setText(text + "%")
-                    return
-                except ValueError:
-                    pass
-        elif unit == "Pixels" and text.endswith("%"):
-            self.size_input.setText(text.rstrip("%"))
-            return
-
-        # Prepare value for validation
-        val_str = text.rstrip("%") if unit == "Percent" else text
-        # Empty input disables button, shows error
-        if not val_str:
-            error_msg = "Please enter a value."
-        else:
-            try:
-                # Strict numeric check, but allow any value while typing
-                if unit == "Percent":
-                    pct_val = float(val_str)
-                    if pct_val < min_pct:
-                        error_msg = f"Minimum allowed is {min_pct}%"
-                    elif pct_val > max_pct:
-                        error_msg = f"Maximum allowed is {max_pct}%"
-                    else:
-                        validated = validate_resize_input(f"{pct_val}%")
-                else:
-                    px_val = float(val_str)
-                    if px_val < min_px:
-                        error_msg = f"Minimum allowed is {min_px}px"
-                    elif px_val > max_px:
-                        error_msg = f"Maximum allowed is {max_px}px"
-                    else:
-                        validated = validate_resize_input(str(int(px_val)))
-
-                # Check for duplicate
-                if (
-                    error_msg == ""
-                    and "validated" in locals()
-                    and validated in self.existing_sizes
-                ):
-                    error_msg = "This size already exists."
-                # Compute preview dimensions robustly
-                if error_msg == "" and "validated" in locals():
-                    if unit == "Percent":
-                        try:
-                            pct = float(str(validated).rstrip("%")) / 100.0
-                            w, h = int(self.ref_width * pct), int(self.ref_height * pct)
-                        except Exception:
-                            error_msg = f"Invalid percent value. Min: {min_pct}%, Max: {max_pct}%"
-                    else:
-                        try:
-                            size = int(validated)
-                            aspect = (
-                                self.ref_width / self.ref_height
-                                if self.ref_height
-                                else 1
-                            )
-                            if mode in ["fit", "crop"]:
-                                if self.ref_width > self.ref_height:
-                                    w, h = size, int(size / aspect) if aspect else size
-                                else:
-                                    h, w = size, int(size * aspect) if aspect else size
-                            elif mode == "width":
-                                w = size
-                                h = (
-                                    int(self.ref_height * (size / self.ref_width))
-                                    if self.ref_width
-                                    else size
-                                )
-                            elif mode == "height":
-                                h = size
-                                w = (
-                                    int(self.ref_width * (size / self.ref_height))
-                                    if self.ref_height
-                                    else size
-                                )
-                            else:
-                                error_msg = "Unknown mode."
-                        except Exception:
-                            error_msg = (
-                                f"Invalid pixel value. Min: {min_px}px, Max: {max_px}px"
-                            )
-                    # If preview dims are valid, set preview
-                    if w is not None and h is not None and error_msg == "":
-                        if w < min_px or h < min_px:
-                            error_msg = f"Resulting dimensions too small (<{min_px}px)."
-                        elif w > max_px or h > max_px:
-                            error_msg = (
-                                f"Resulting dimensions too large (> {max_px}px)."
-                            )
-                        else:
-                            preview = f"Preview: {w}x{h} px"
-                            valid = True
-            except Exception as e:
-                # More specific error messages
-                msg = str(e)
-                if "range" in msg.lower():
-                    error_msg = "Value out of allowed range."
-                elif "invalid" in msg.lower():
-                    error_msg = msg
-                else:
-                    error_msg = "Invalid input."
-
-        # UI feedback
-        self.validation_label.setText(error_msg)
-        self.size_input.setProperty("valid", "true" if valid else "false")
-        self.ok_button.setEnabled(valid)
-        self.preview_label.setText(preview)
-
-        # No clamping timer needed: clamp only on focus out or submit
-        self.clamp_timer.stop()
-
-        # Update style
-        self.size_input.style().unpolish(self.size_input)
-        self.size_input.style().polish(self.size_input)
-
-    def focusOutEvent(self, event):
-        """Clamp value to allowed range on focus out."""
-        super().focusOutEvent(event)
-        self.clamp_input_to_range()
-
-    def clamp_input_to_range(self):
-        text = self.size_input.text().strip()
-        unit = self.unit_combo.currentText()
-        min_px = 8
-        max_px = 10000
-        min_pct = 0.5
-        max_pct = 100
-        val_str = text.rstrip("%") if unit == "Percent" else text
-        try:
-            if unit == "Percent":
-                pct_val = float(val_str)
-                if pct_val < min_pct:
-                    self.size_input.setText(f"{min_pct:.2f}%")
-                elif pct_val > max_pct:
-                    self.size_input.setText(f"{max_pct:.2f}%")
-            else:
-                px_val = float(val_str)
-                if px_val < min_px:
-                    self.size_input.setText(str(min_px))
-                elif px_val > max_px:
-                    self.size_input.setText(str(max_px))
-        except Exception:
-            pass
-
-    def apply_clamp(self):
-        """Clamp the value to valid range after typing delay."""
-        text = self.size_input.text().strip()
-        unit = self.unit_combo.currentText()
-
-        val_str = text.rstrip("%") if unit == "Percent" else text
-        try:
-            val = float(val_str)
-        except ValueError:
-            return  # Not clampable
-
-        if unit == "Percent":
-            clamped = max(1, min(100, val))
-            new_text = (
-                f"{clamped:.2f}%" if not clamped.is_integer() else f"{int(clamped)}%"
-            )
-        else:
-            clamped = max(2, min(10000, val))
-            new_text = f"{int(clamped)}"
-
-        self.size_input.setText(new_text)
-        # Re-validate after clamp
-        self.validate_and_update()
-
-    def get_result(self):
-        """Return validated size and mode."""
-        text = self.size_input.text()
-        unit = self.unit_combo.currentText()
-        if unit == "Percent" and not text.endswith("%"):
-            text += "%"
-        return validate_resize_input(text), self.mode_combo.currentText()
 
 
 class MainWin(QWidget):
@@ -1842,22 +1420,21 @@ class MainWin(QWidget):
         self.resTable.setCellWidget(row, 1, cb)
 
     def addResDialog(self):
-        # Collect existing sizes to prevent duplicates
-        existing_sizes = set()
-        for row in range(self.resTable.rowCount()):
-            size_item = self.resTable.item(row, 0)
-            if size_item:
-                try:
-                    existing_sizes.add(validate_resize_input(size_item.text()))
-                except ValueError:
-                    continue
-
-        dialog = ResolutionDialog(
-            self, existing_sizes, getattr(self, "input_files", [])
+        n, ok = QInputDialog.getText(
+            self,
+            "Add Resolution",
+            "Enter pixel size (2-10000) or percent (1-100%):",
+            QLineEdit.Normal,
+            text="256",
         )
-        if dialog.exec():
-            size, mode = dialog.get_result()
-            self.addResRow(size, mode)
+        if not ok or not n:
+            return
+        try:
+            n_valid = validate_resize_input(n)
+        except ValueError as e:
+            QMessageBox.critical(self, "Invalid Resolution", str(e))
+            return
+        self.addResRow(n_valid, "fit")
 
     def delRes(self):
         selected = self.resTable.selectionModel().selectedRows()
@@ -2029,16 +1606,6 @@ class MainWin(QWidget):
             self.progress_bar.setValue(percentage)
 
     def update_status(self, status):
-        # Show errors in notification area (status_label) and keep previous text for non-errors
-        if status and (
-            "error" in status.lower()
-            or "failed" in status.lower()
-            or "invalid" in status.lower()
-            or "reserved" in status.lower()
-        ):
-            self.status_label.setStyleSheet("color: red;")
-        else:
-            self.status_label.setStyleSheet("")
         self.status_label.setText(status)
 
     def update_stats(self, stats: FileStats):
